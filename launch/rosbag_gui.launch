@@ -1,0 +1,3 @@
+<launch>
+  <node pkg="rosbag_gui" type="rosbag_gui.py" name="rosbag_gui" output="screen" />
+</launch>
