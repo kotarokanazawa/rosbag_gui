@@ -14,42 +14,22 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional
 
-import rospy
-import rostopic
+import rclpy
+from rclpy.node import Node
+from rosidl_runtime_py.utilities import get_message
+from rosidl_runtime_py.convert import message_to_ordereddict
+from rclpy.serialization import deserialize_message
+import rosbag2_py
 from PyQt5 import QtWidgets, QtCore
 
-try:
-    import rospkg
-except Exception:
-    rospkg = None
-
-
 def package_default_save_dir() -> str:
-    if rospkg is not None:
-        try:
-            rp = rospkg.RosPack()
-            pkg_path = rp.get_path("rosbag_gui")
-            p = os.path.join(pkg_path, "rosbag")
-            os.makedirs(p, exist_ok=True)
-            return p
-        except Exception:
-            pass
-    p = os.path.expanduser("~/catkin_ws/src/rosbag_gui/rosbag")
+    p = os.path.expanduser("~/rosbag")
     os.makedirs(p, exist_ok=True)
     return p
 
 
 def package_preset_dir() -> str:
-    if rospkg is not None:
-        try:
-            rp = rospkg.RosPack()
-            pkg_path = rp.get_path("rosbag_gui")
-            p = os.path.join(pkg_path, "presets")
-            os.makedirs(p, exist_ok=True)
-            return p
-        except Exception:
-            pass
-    p = os.path.expanduser("~/catkin_ws/src/rosbag_gui/presets")
+    p = os.path.expanduser("~/.config/rosbag_gui/presets")
     os.makedirs(p, exist_ok=True)
     return p
 
@@ -154,12 +134,54 @@ class BagInfoWorker(QtCore.QThread):
 
     def run(self):
         try:
-            cmd = ["rosbag", "info", "--yaml", self.bag_path]
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            info = yaml.safe_load(res.stdout) or {}
+            metadata_path = os.path.join(self.bag_path, "metadata.yaml")
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+            meta = raw.get("rosbag2_bagfile_information", raw)
+            duration_raw = meta.get("duration", {})
+            duration_ns = duration_raw.get("nanoseconds", 0) if isinstance(duration_raw, dict) else duration_raw
+            topics = []
+            messages = 0
+            for entry in meta.get("topics_with_message_count", []) or []:
+                md = entry.get("topic_metadata", {}) or {}
+                count = int(entry.get("message_count", 0) or 0)
+                messages += count
+                topics.append({
+                    "topic": md.get("name", ""),
+                    "type": md.get("type", "unknown"),
+                    "count": count,
+                })
+            size = 0
+            for rel in meta.get("relative_file_paths", []) or []:
+                fp = os.path.join(self.bag_path, rel)
+                if os.path.isfile(fp):
+                    size += os.path.getsize(fp)
+            info = {
+                "duration": float(duration_ns or 0) / 1e9,
+                "messages": messages,
+                "size": human_bytes(size),
+                "topics": topics,
+                "storage_identifier": meta.get("storage_identifier", ""),
+            }
             self.result_ready.emit(info)
         except Exception as e:
             self.error_occurred.emit(str(e))
+
+
+def _flatten_message(value, prefix=""):
+    out = {}
+    if isinstance(value, dict):
+        for k, v in value.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                out.update(_flatten_message(v, key))
+            elif isinstance(v, (list, tuple)):
+                out[key] = json.dumps(v, ensure_ascii=False, default=str)
+            else:
+                out[key] = v
+    else:
+        out[prefix or "data"] = value
+    return out
 
 
 class CsvConvertWorker(QtCore.QThread):
@@ -174,18 +196,53 @@ class CsvConvertWorker(QtCore.QThread):
         self.topics = topics
 
     def run(self):
+        import csv
         os.makedirs(self.out_dir, exist_ok=True)
-        failed = []
         try:
-            for i, topic in enumerate(self.topics, 1):
-                csv_path = os.path.join(self.out_dir, sanitize_filename(topic) + ".csv")
-                cmd = f'rostopic echo -b {shlex.quote(self.bag_path)} -p {shlex.quote(topic)} > {shlex.quote(csv_path)}'
-                self.log_line.emit(f"CSV変換 [{i}/{len(self.topics)}] {topic}")
-                ret = subprocess.run(cmd, shell=True)
-                if ret.returncode != 0:
-                    failed.append(topic)
-            if failed:
-                self.finished_ng.emit("CSV変換は完了しましたが，一部失敗しました:\n" + "\n".join(failed))
+            metadata_path = os.path.join(self.bag_path, "metadata.yaml")
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+            meta = raw.get("rosbag2_bagfile_information", raw)
+            storage_id = meta.get("storage_identifier", "") or ""
+
+            reader = rosbag2_py.SequentialReader()
+            reader.open(
+                rosbag2_py.StorageOptions(uri=self.bag_path, storage_id=storage_id),
+                rosbag2_py.ConverterOptions("", ""),
+            )
+            topic_type_map = {x.name: x.type for x in reader.get_all_topics_and_types()}
+            selected = set(self.topics)
+            handles = {}
+            writers = {}
+            fieldnames = {}
+            counts = {t: 0 for t in selected}
+            try:
+                while reader.has_next():
+                    topic, data, timestamp = reader.read_next()
+                    if topic not in selected:
+                        continue
+                    msg_type = get_message(topic_type_map[topic])
+                    msg = deserialize_message(data, msg_type)
+                    row = {"timestamp_ns": timestamp, "timestamp_sec": timestamp / 1e9}
+                    row.update(_flatten_message(message_to_ordereddict(msg)))
+                    if topic not in writers:
+                        csv_path = os.path.join(self.out_dir, sanitize_filename(topic) + ".csv")
+                        h = open(csv_path, "w", newline="", encoding="utf-8")
+                        fields = list(row.keys())
+                        w = csv.DictWriter(h, fieldnames=fields, extrasaction="ignore")
+                        w.writeheader()
+                        handles[topic] = h
+                        writers[topic] = w
+                        fieldnames[topic] = fields
+                        self.log_line.emit(f"CSV変換: {topic}")
+                    writers[topic].writerow(row)
+                    counts[topic] += 1
+            finally:
+                for h in handles.values():
+                    h.close()
+            missing = [t for t, c in counts.items() if c == 0]
+            if missing:
+                self.finished_ng.emit("一部Topicにメッセージがありませんでした:\n" + "\n".join(sorted(missing)))
             else:
                 self.finished_ok.emit(self.out_dir)
         except Exception as e:
@@ -203,26 +260,45 @@ class BagCompressWorker(QtCore.QThread):
         self.mode = mode
 
     def run(self):
+        import tempfile
         try:
-            if self.mode not in ("bz2", "lz4"):
-                self.finished_ng.emit("圧縮方式は bz2 または lz4 のみ対応です。")
-                return
-            cmd = ["rosbag", "compress", f"--{self.mode}", self.bag_path]
+            parent = os.path.dirname(os.path.abspath(self.bag_path))
+            base = os.path.basename(os.path.normpath(self.bag_path))
+            out_path = os.path.join(parent, base + "_compressed")
+            cfg = {
+                "output_bags": [{
+                    "uri": out_path,
+                    "storage_id": "",
+                    "all_topics": True,
+                    "all_services": True,
+                    "compression_mode": "file",
+                    "compression_format": "zstd",
+                }]
+            }
+            with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+                yaml.safe_dump(cfg, f, sort_keys=False)
+                cfg_path = f.name
+            cmd = ["ros2", "bag", "convert", "-i", self.bag_path, "-o", cfg_path]
             self.log_line.emit("圧縮開始: " + quote_join(cmd))
             res = subprocess.run(cmd, capture_output=True, text=True)
+            try:
+                os.unlink(cfg_path)
+            except OSError:
+                pass
             if res.stdout.strip():
                 self.log_line.emit(res.stdout.strip())
             if res.returncode != 0:
-                self.finished_ng.emit(res.stderr.strip() or "rosbag compress に失敗しました。")
+                self.finished_ng.emit(res.stderr.strip() or "ros2 bag convert に失敗しました。")
                 return
-            self.finished_ok.emit(self.bag_path)
+            self.finished_ok.emit(out_path)
         except Exception as e:
             self.finished_ng.emit(str(e))
 
 
 class RosbagGuiWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, node: Node):
         super().__init__()
+        self.node = node
         self.setWindowTitle("rosbag_gui")
         self.resize(1480, 940)
         self.setMinimumSize(1100, 760)
@@ -357,8 +433,8 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         self.rec_split_check.toggled.connect(self.rec_split_size_spin.setEnabled)
 
         self.rec_none_radio = QtWidgets.QRadioButton("なし")
-        self.rec_bz2_radio = QtWidgets.QRadioButton("bz2")
-        self.rec_lz4_radio = QtWidgets.QRadioButton("lz4")
+        self.rec_bz2_radio = QtWidgets.QRadioButton("zstd")
+        self.rec_lz4_radio = QtWidgets.QRadioButton("zstd(message)")
         self.rec_none_radio.setChecked(True)
 
         self.rec_buff_spin = QtWidgets.QSpinBox()
@@ -370,6 +446,7 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         self.rec_chunk_spin.setRange(64, 40960)
         self.rec_chunk_spin.setValue(768)
         self.rec_chunk_spin.setSuffix(" KB")
+        self.rec_chunk_spin.setVisible(False)
 
         save_grid.addWidget(QtWidgets.QLabel("保存先"), 0, 0)
         save_grid.addWidget(self.rec_dir_edit, 0, 1)
@@ -379,9 +456,11 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         save_grid.addWidget(self.rec_stamp_check, 1, 2)
         save_grid.addWidget(self.rec_split_check, 2, 0)
         save_grid.addWidget(self.rec_split_size_spin, 2, 1)
-        save_grid.addWidget(QtWidgets.QLabel("buffer"), 3, 0)
+        save_grid.addWidget(QtWidgets.QLabel("max cache"), 3, 0)
         save_grid.addWidget(self.rec_buff_spin, 3, 1)
-        save_grid.addWidget(QtWidgets.QLabel("chunk"), 3, 2)
+        self.rec_chunk_label = QtWidgets.QLabel("cache")
+        self.rec_chunk_label.setVisible(False)
+        save_grid.addWidget(self.rec_chunk_label, 3, 2)
         save_grid.addWidget(self.rec_chunk_spin, 3, 3)
 
         comp = QtWidgets.QHBoxLayout()
@@ -500,7 +579,7 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         self.play_info_label = QtWidgets.QLabel("-")
         self.play_info_label.setWordWrap(True)
 
-        fg.addWidget(QtWidgets.QLabel("bagファイル"), 0, 0)
+        fg.addWidget(QtWidgets.QLabel("bagディレクトリ"), 0, 0)
         fg.addWidget(self.play_bag_edit, 0, 1)
         fg.addWidget(self.play_bag_btn, 0, 2)
         fg.addWidget(self.play_read_btn, 0, 3)
@@ -594,8 +673,9 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         self.play_clock_check.setChecked(True)
         self.play_clock_check.toggled.connect(self._update_play_command_preview)
 
-        self.play_use_sim_time_check = QtWidgets.QCheckBox("/use_sim_time を自動切替")
-        self.play_use_sim_time_check.setChecked(True)
+        self.play_use_sim_time_check = QtWidgets.QCheckBox("/clockを配信（各Node側でuse_sim_timeを設定）")
+        self.play_use_sim_time_check.setChecked(False)
+        self.play_use_sim_time_check.setVisible(False)
 
         self.play_pause_check = QtWidgets.QCheckBox("開始時 pause")
         self.play_pause_check.toggled.connect(self._update_play_command_preview)
@@ -604,14 +684,17 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         self.play_loop_check.toggled.connect(self._update_play_command_preview)
 
         self.play_keep_alive_check = QtWidgets.QCheckBox("--keep-alive")
-        self.play_keep_alive_check.setChecked(True)
+        self.play_keep_alive_check.setChecked(False)
+        self.play_keep_alive_check.setVisible(False)
         self.play_keep_alive_check.toggled.connect(self._update_play_command_preview)
 
         self.play_wait_sub_check = QtWidgets.QCheckBox("--wait-for-subscribers")
         self.play_wait_sub_check.toggled.connect(self._update_play_command_preview)
+        self.play_wait_sub_check.setVisible(False)
 
         self.play_quiet_check = QtWidgets.QCheckBox("--quiet")
         self.play_quiet_check.toggled.connect(self._update_play_command_preview)
+        self.play_quiet_check.setVisible(False)
 
         flags = QtWidgets.QGridLayout()
         flags.setHorizontalSpacing(18)
@@ -710,7 +793,7 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         self.csv_convert_btn = QtWidgets.QPushButton("CSV変換実行")
         self.bag_compress_btn = QtWidgets.QPushButton("bag圧縮実行")
         self.bag_compress_mode_combo = QtWidgets.QComboBox()
-        self.bag_compress_mode_combo.addItems(["lz4", "bz2"])
+        self.bag_compress_mode_combo.addItems(["zstd"])
 
         self.csv_bag_btn.clicked.connect(self.choose_csv_bag)
         self.csv_scan_btn.clicked.connect(self.load_csv_topics_from_bag)
@@ -720,7 +803,7 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         self.csv_convert_btn.clicked.connect(self.convert_bag_to_csv)
         self.bag_compress_btn.clicked.connect(self.compress_existing_bag)
 
-        g.addWidget(QtWidgets.QLabel("bagファイル"), 0, 0)
+        g.addWidget(QtWidgets.QLabel("bagディレクトリ"), 0, 0)
         g.addWidget(self.csv_bag_edit, 0, 1)
         g.addWidget(self.csv_bag_btn, 0, 2)
         g.addWidget(self.csv_scan_btn, 0, 3)
@@ -907,12 +990,13 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         base = self.rec_name_edit.text().strip() or "record"
         if self.rec_stamp_check.isChecked():
             base += "_" + now_string()
-        return os.path.join(out_dir, base + ".bag")
+        return os.path.join(out_dir, base)
 
     def refresh_live_topics(self):
         checked = {r.topic_name for r in self.topic_rows if r.is_checked()}
         try:
-            topics = sorted(rospy.get_published_topics())
+            rclpy.spin_once(self.node, timeout_sec=0.05)
+            topics = sorted((name, ", ".join(types)) for name, types in self.node.get_topic_names_and_types())
         except Exception as e:
             self.log(f"topic一覧の取得に失敗: {e}")
             topics = []
@@ -1022,15 +1106,14 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
             return
 
         bag_path = self._build_record_path()
-        cmd = ["rosbag", "record", "-O", bag_path]
+        cmd = ["ros2", "bag", "record", "-o", bag_path]
         if self.rec_split_check.isChecked():
-            cmd += ["--split", f"--size={self.rec_split_size_spin.value()}"]
+            cmd += ["--max-bag-size", str(self.rec_split_size_spin.value() * 1024 * 1024)]
         if self.rec_bz2_radio.isChecked():
-            cmd += ["--bz2"]
+            cmd += ["--compression-mode", "file", "--compression-format", "zstd"]
         elif self.rec_lz4_radio.isChecked():
-            cmd += ["--lz4"]
-        cmd += ["--buffsize", str(self.rec_buff_spin.value() * 1024 * 1024)]
-        cmd += ["--chunksize", str(self.rec_chunk_spin.value() * 1024)]
+            cmd += ["--compression-mode", "message", "--compression-format", "zstd"]
+        cmd += ["--max-cache-size", str(self.rec_buff_spin.value() * 1024 * 1024)]
         cmd += topics
 
         try:
@@ -1050,7 +1133,7 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
             self.set_header_state("SAVING")
             self.csv_bag_edit.setText(bag_path)
             if not self.csv_out_dir_edit.text().strip():
-                self.csv_out_dir_edit.setText(os.path.splitext(bag_path)[0] + "_csv")
+                self.csv_out_dir_edit.setText(bag_path.rstrip(os.sep) + "_csv")
             self.log("保存開始: " + quote_join(cmd))
         except Exception as e:
             self.record_proc = None
@@ -1089,27 +1172,28 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
             return 0
         total = 0
         try:
-            if os.path.exists(path):
-                total += os.path.getsize(path)
-            parent = os.path.dirname(path) or "."
-            stem = os.path.splitext(os.path.basename(path))[0]
-            for name in os.listdir(parent):
-                if name.startswith(stem + "_") and name.endswith(".bag"):
-                    total += os.path.getsize(os.path.join(parent, name))
+            if os.path.isdir(path):
+                for root, _, files in os.walk(path):
+                    for name in files:
+                        fp = os.path.join(root, name)
+                        if os.path.isfile(fp):
+                            total += os.path.getsize(fp)
+            elif os.path.isfile(path):
+                total = os.path.getsize(path)
         except Exception:
             pass
         return total
 
     def choose_play_bag(self):
-        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "bagファイルを選択", package_default_save_dir(), "ROS bag (*.bag)")
+        f = QtWidgets.QFileDialog.getExistingDirectory(self, "bagディレクトリを選択", package_default_save_dir())
         if f:
             self.play_bag_edit.setText(f)
             self.load_play_bag_info()
 
     def load_play_bag_info(self):
         bag_path = self.play_bag_edit.text().strip()
-        if not bag_path or not os.path.isfile(bag_path):
-            QtWidgets.QMessageBox.warning(self, "警告", "有効なbagファイルを指定してください。")
+        if not bag_path or not os.path.isdir(bag_path):
+            QtWidgets.QMessageBox.warning(self, "警告", "有効なbagディレクトリを指定してください。")
             return
         self.play_info_label.setText("読み込み中...")
         self.bag_info_worker = BagInfoWorker(bag_path)
@@ -1194,33 +1278,30 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
 
     def _build_play_command(self) -> List[str]:
         bag_path = self.play_bag_edit.text().strip()
-        cmd = ["rosbag", "play", bag_path]
+        cmd = ["ros2", "bag", "play", bag_path]
         selected = self.get_checked_play_topics()
         if selected:
             cmd += ["--topics"] + selected
         if abs(self.play_rate_spin.value() - 1.0) > 1e-9:
-            cmd += ["-r", str(self.play_rate_spin.value())]
+            cmd += ["--rate", str(self.play_rate_spin.value())]
         if self.play_start_spin.value() > 0.0:
-            cmd += ["-s", str(self.play_start_spin.value())]
+            cmd += ["--start-offset", str(self.play_start_spin.value())]
         if self.play_duration_spin.value() > 0.0:
-            cmd += ["-u", str(self.play_duration_spin.value())]
+            cmd += ["--duration", str(self.play_duration_spin.value())]
         if self.play_delay_spin.value() > 0.0:
-            cmd += ["-d", str(self.play_delay_spin.value())]
+            cmd += ["--delay", str(self.play_delay_spin.value())]
         if self.play_clock_check.isChecked():
             cmd += ["--clock"]
-        if self.play_keep_alive_check.isChecked():
-            cmd += ["--keep-alive"]
         if self.play_pause_check.isChecked():
-            cmd += ["--pause"]
+            cmd += ["--start-paused"]
         if self.play_loop_check.isChecked():
             cmd += ["--loop"]
-        if self.play_quiet_check.isChecked():
-            cmd += ["--quiet"]
-        if self.play_wait_sub_check.isChecked():
-            cmd += ["--wait-for-subscribers"]
-        cmd += ["--queue", str(self.play_queue_spin.value())]
-        cmd += self._collect_remap_rules()
+        cmd += ["--read-ahead-queue-size", str(self.play_queue_spin.value())]
+        remaps = self._collect_remap_rules()
+        if remaps:
+            cmd += ["--remap"] + remaps
         return cmd
+
 
     def _update_play_command_preview(self):
         bag_path = self.play_bag_edit.text().strip()
@@ -1275,17 +1356,14 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         if self.play_proc is not None:
             return
         bag_path = self.play_bag_edit.text().strip()
-        if not bag_path or not os.path.isfile(bag_path):
-            QtWidgets.QMessageBox.warning(self, "警告", "再生するbagファイルを指定してください。")
+        if not bag_path or not os.path.isdir(bag_path):
+            QtWidgets.QMessageBox.warning(self, "警告", "再生するbagディレクトリを指定してください。")
             return
         if self.play_topic_rows and not self.get_checked_play_topics():
             QtWidgets.QMessageBox.warning(self, "警告", "再生するtopicを少なくとも1つ選択してください。")
             return
         cmd = self._build_play_command()
         try:
-            if self.play_use_sim_time_check.isChecked():
-                subprocess.run(["rosparam", "set", "/use_sim_time", "true"], check=False)
-                self.log("/use_sim_time を true に設定")
             self.play_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
             self.play_started_at = time.time()
             self.play_start_btn.setEnabled(False)
@@ -1323,13 +1401,10 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         self.play_start_btn.setEnabled(True)
         self.play_stop_btn.setEnabled(False)
         self.play_status_label.setText("待機中")
-        if self.play_use_sim_time_check.isChecked():
-            subprocess.run(["rosparam", "set", "/use_sim_time", "false"], check=False)
-            self.log("/use_sim_time を false に戻しました")
         self.set_header_state("READY")
 
     def choose_csv_bag(self):
-        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "bagファイルを選択", package_default_save_dir(), "ROS bag (*.bag)")
+        f = QtWidgets.QFileDialog.getExistingDirectory(self, "bagディレクトリを選択", package_default_save_dir())
         if f:
             self.csv_bag_edit.setText(f)
             self.load_csv_topics_from_bag()
@@ -1349,15 +1424,15 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
 
     def load_csv_topics_from_bag(self):
         bag_path = self.csv_bag_edit.text().strip()
-        if not bag_path or not os.path.isfile(bag_path):
-            QtWidgets.QMessageBox.warning(self, "警告", "有効なbagファイルを指定してください。")
+        if not bag_path or not os.path.isdir(bag_path):
+            QtWidgets.QMessageBox.warning(self, "警告", "有効なbagディレクトリを指定してください。")
             return
         self.bag_info_worker = BagInfoWorker(bag_path)
         self.bag_info_worker.result_ready.connect(self.load_csv_topics_from_info)
         self.bag_info_worker.error_occurred.connect(lambda msg: QtWidgets.QMessageBox.critical(self, "エラー", msg))
         self.bag_info_worker.start()
         if not self.csv_out_dir_edit.text().strip():
-            self.csv_out_dir_edit.setText(os.path.splitext(bag_path)[0] + "_csv")
+            self.csv_out_dir_edit.setText(bag_path.rstrip(os.sep) + "_csv")
 
     def _set_listwidget_checks(self, lw: QtWidgets.QListWidget, checked: bool):
         state = QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked
@@ -1376,10 +1451,10 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         if self.csv_worker is not None and self.csv_worker.isRunning():
             return
         bag_path = self.csv_bag_edit.text().strip()
-        if not bag_path or not os.path.isfile(bag_path):
-            QtWidgets.QMessageBox.warning(self, "警告", "有効なbagファイルを指定してください。")
+        if not bag_path or not os.path.isdir(bag_path):
+            QtWidgets.QMessageBox.warning(self, "警告", "有効なbagディレクトリを指定してください。")
             return
-        out_dir = self.csv_out_dir_edit.text().strip() or (os.path.splitext(bag_path)[0] + "_csv")
+        out_dir = self.csv_out_dir_edit.text().strip() or (bag_path.rstrip(os.sep) + "_csv")
         self.csv_out_dir_edit.setText(out_dir)
         topics = self.get_csv_selected_topics()
         if not topics:
@@ -1406,8 +1481,8 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         if self.compress_worker is not None and self.compress_worker.isRunning():
             return
         bag_path = self.csv_bag_edit.text().strip()
-        if not bag_path or not os.path.isfile(bag_path):
-            QtWidgets.QMessageBox.warning(self, "警告", "圧縮するbagファイルを指定してください。")
+        if not bag_path or not os.path.isdir(bag_path):
+            QtWidgets.QMessageBox.warning(self, "警告", "圧縮するbagディレクトリを指定してください。")
             return
         mode = self.bag_compress_mode_combo.currentText().strip()
         self.bag_compress_btn.setEnabled(False)
@@ -1491,13 +1566,18 @@ class RosbagGuiWindow(QtWidgets.QMainWindow):
         event.accept()
 
 
-def main():
-    rospy.init_node("rosbag_gui", anonymous=True, disable_signals=True)
+def main(args=None):
+    rclpy.init(args=args)
+    node = rclpy.create_node("rosbag_gui")
     app = QtWidgets.QApplication(sys.argv)
-    w = RosbagGuiWindow()
+    w = RosbagGuiWindow(node)
     w.show()
-    sys.exit(app.exec_())
+    try:
+        return app.exec_()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
